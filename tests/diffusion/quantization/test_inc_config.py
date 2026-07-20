@@ -37,6 +37,40 @@ def test_build_quant_config_inc():
     assert config.weight_bits == 4
 
 
+def test_build_quant_config_autoround_mxfp4_preserves_schema():
+    """Qwen3-Omni MXFP4 metadata must reach vLLM's INCConfig unchanged."""
+    from vllm_omni.quantization import build_quant_config
+
+    extra_config = {
+        ".*self_attn.*": {
+            "bits": 16,
+            "data_type": "float",
+            "act_bits": 16,
+            "act_data_type": "float",
+        }
+    }
+    config = build_quant_config(
+        "auto-round",
+        bits=4,
+        act_bits=4,
+        data_type="mx_fp",
+        act_data_type="mx_fp",
+        group_size=32,
+        act_group_size=32,
+        sym=True,
+        packing_format="auto_round:llm_compressor",
+        block_name_to_quantize="thinker.model.layers",
+        extra_config=extra_config,
+    )
+
+    assert config.weight_bits == 4
+    assert config.group_size == 32
+    assert config.data_type == "mx_fp"
+    assert config.packing_format == "auto_round:llm_compressor"
+    assert config.block_name_to_quantize == ["thinker.model.layers"]
+    assert config.extra_config == extra_config
+
+
 def test_build_quant_config_autoround_dict():
     """Dict-style config with method=auto-round should work."""
     from vllm.model_executor.layers.quantization.inc import INCConfig

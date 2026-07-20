@@ -35,18 +35,25 @@ def _map_with_stage_prefix(
     prefix_map: dict[str, str | None],
     stage: str,
 ) -> list[str]:
-    """Apply *prefix_map* to each item and prepend *stage* to mapped items."""
+    """Apply *prefix_map* and retain stage-local and container-prefixed names."""
     sorted_keys = sorted(prefix_map, key=len, reverse=True)
     result: list[str] = []
     for item in items:
         new_item = item
+        matched = False
         for orig in sorted_keys:
             if item.startswith(orig):
                 new_val = prefix_map[orig] or ""
-                new_item = stage + new_val + item[len(orig) :]
+                new_item = new_val + item[len(orig) :]
+                matched = True
                 break
-        result.append(new_item)
-    return result
+        result.append(stage + new_item if matched else item)
+        if stage and matched:
+            # Some Omni stages instantiate the component model directly, so
+            # its runtime prefix starts at ``language_model`` rather than the
+            # outer ``thinker``/``talker`` container. Keep both forms.
+            result.append(new_item)
+    return list(dict.fromkeys(result))
 
 
 class OmniINCConfig(INCConfig):
@@ -80,7 +87,7 @@ class OmniINCConfig(INCConfig):
                 return IncMxfp8OfflineLinearMethod()
             return None
 
-        # Otherwise, use parent INCConfig logic
+        # Otherwise, use parent INCConfig logic.
         return super().get_quant_method(layer, prefix)
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: WeightsMapper) -> None:
@@ -134,7 +141,10 @@ class OmniINCConfig(INCConfig):
                     for orig in sorted_keys:
                         if key.startswith(orig):
                             new_val = prefix_map[orig] or ""
-                            new_key = stage + new_val + key[len(orig) :]
+                            mapped_key = new_val + key[len(orig) :]
+                            new_key = stage + mapped_key
+                            if stage:
+                                new_extra[mapped_key] = val
                             break
                 new_extra[new_key] = val
             self.extra_config = new_extra
@@ -154,6 +164,10 @@ class OmniINCConfig(INCConfig):
         """
         omni = object.__new__(cls)
         omni.__dict__.update(inc.__dict__)
+        # INCConfigParser keeps a reference to its owning config. Reusing the
+        # parser copied from ``inc`` would make later prefix remapping mutate
+        # ``omni`` while layer resolution still reads the stale vanilla config.
+        omni.config_parser = type(inc.config_parser)(omni)
         return omni
 
     @classmethod

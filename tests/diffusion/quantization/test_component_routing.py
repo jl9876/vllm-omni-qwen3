@@ -9,6 +9,8 @@ import torch
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
+from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.models.utils import WeightsMapper
 
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -157,6 +159,7 @@ class TestApplyVllmMapper:
         cfg = _make_inc_config("thinker.model.layers,talker.model.layers")
         cfg.apply_vllm_mapper(THINKER_MAPPER)
         assert "thinker.language_model.model.layers" in cfg.block_name_to_quantize
+        assert "language_model.model.layers" in cfg.block_name_to_quantize
 
     def test_talker_block_has_stage_prefix(self):
         """Mapped block name must start with 'talker.' so runtime startswith() works."""
@@ -170,6 +173,34 @@ class TestApplyVllmMapper:
         cfg.apply_vllm_mapper(THINKER_MAPPER)
         runtime_prefix = "thinker.language_model.model.layers.0.mlp.experts"
         assert any(runtime_prefix.startswith(b) for b in cfg.block_name_to_quantize)
+
+    def test_thinker_local_block_matches_mxfp4_runtime_prefix(self):
+        """A directly instantiated Thinker LM resolves its local prefix as MXFP4."""
+        cfg = OmniINCConfig(
+            weight_bits=4,
+            group_size=32,
+            sym=True,
+            packing_format="auto_round:llm_compressor",
+            block_name_to_quantize="thinker.model.layers",
+            data_type="mx_fp",
+        )
+        cfg.apply_vllm_mapper(THINKER_MAPPER)
+
+        runtime_prefix = "language_model.model.layers.0.mlp.experts"
+        layer_config = cfg.config_parser.resolve(MagicMock(), runtime_prefix)
+
+        assert layer_config.quantized
+        assert layer_config.is_mxfp4
+
+    def test_thinker_mapping_is_idempotent(self):
+        """Repeated model setup must not duplicate or corrupt mapped names."""
+        cfg = _make_inc_config("thinker.model.layers,talker.model.layers")
+
+        cfg.apply_vllm_mapper(THINKER_MAPPER)
+        expected = list(cfg.block_name_to_quantize)
+        cfg.apply_vllm_mapper(THINKER_MAPPER)
+
+        assert cfg.block_name_to_quantize == expected
 
     def test_talker_block_matches_runtime_prefix(self):
         """Simulates get_layer_config's startswith() check for talker FusedMoE."""
@@ -186,6 +217,7 @@ class TestApplyVllmMapper:
         cfg = _make_inc_config("talker.model.layers", extra_config=extra)
         cfg.apply_vllm_mapper(TALKER_MAPPER)
         assert "talker.language_model.model.layers.0.mlp.shared_expert_gate" in cfg.extra_config
+        assert "language_model.model.layers.0.mlp.shared_expert_gate" in cfg.extra_config
 
     def test_extra_config_regex_key_still_works(self):
         """Regex extra_config keys use re.search so no stage prefix needed."""
@@ -229,6 +261,86 @@ class TestOmniINCConfigUpgrade:
         assert isinstance(upgraded, OmniINCConfig)
         assert upgraded.weight_bits == 4
         assert upgraded.group_size == 128
+
+    def test_upgraded_config_parser_tracks_mapped_mxfp4_blocks(self):
+        """The promoted parser must resolve names remapped on the Omni config."""
+        from vllm.model_executor.layers.quantization.inc import INCConfig
+
+        vanilla = INCConfig(
+            weight_bits=4,
+            group_size=32,
+            sym=True,
+            packing_format="auto_round:llm_compressor",
+            block_name_to_quantize="thinker.model.layers",
+            data_type="mx_fp",
+        )
+        upgraded = OmniINCConfig.maybe_upgrade(vanilla)
+        upgraded.apply_vllm_mapper(THINKER_MAPPER)
+
+        layer_config = upgraded.config_parser.resolve(
+            MagicMock(), "language_model.model.layers.0.mlp.experts"
+        )
+
+        assert upgraded.config_parser._config is upgraded
+        assert layer_config.quantized
+        assert layer_config.is_mxfp4
+
+
+class TestMxfp4ParentDispatch:
+    @staticmethod
+    def _config():
+        cfg = OmniINCConfig(
+            weight_bits=4,
+            group_size=32,
+            sym=True,
+            packing_format="auto_round:llm_compressor",
+            block_name_to_quantize="thinker.model.layers",
+            data_type="mx_fp",
+        )
+        cfg.apply_vllm_mapper(THINKER_MAPPER)
+        return cfg
+
+    def test_linear_dispatch_is_delegated_to_vllm(self, monkeypatch):
+        sentinel = object()
+        captured = {}
+
+        def fake_get_quant_method(self, layer, prefix):
+            captured.update(layer=layer, prefix=prefix)
+            return sentinel
+
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.quantization.inc.INCConfig.get_quant_method",
+            fake_get_quant_method,
+        )
+        layer = object.__new__(LinearBase)
+
+        method = self._config().get_quant_method(
+            layer, "language_model.model.layers.0.mlp.shared_expert.gate_proj"
+        )
+
+        assert method is sentinel
+        assert captured["layer"] is layer
+
+    def test_moe_dispatch_is_delegated_to_vllm(self, monkeypatch):
+        sentinel = object()
+        captured = {}
+
+        def fake_get_quant_method(self, layer, prefix):
+            captured.update(layer=layer, prefix=prefix)
+            return sentinel
+
+        monkeypatch.setattr(
+            "vllm.model_executor.layers.quantization.inc.INCConfig.get_quant_method",
+            fake_get_quant_method,
+        )
+        layer = object.__new__(RoutedExperts)
+
+        method = self._config().get_quant_method(
+            layer, "language_model.model.layers.0.mlp.experts"
+        )
+
+        assert method is sentinel
+        assert captured["layer"] is layer
 
 
 # ===================================================================

@@ -36,16 +36,20 @@ class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
         hf_config,
         hf_text_config,
         stage_config_name: str | None = None,
+        model_stage: str | None = None,
     ):
         super().__init__(hf_config, hf_text_config)
         self.stage_config_name = stage_config_name
+        self.model_stage = model_stage
 
     def get_quantization_config(self):
         # When a stage_config_name is set, look for quantization config
         # in that stage's text_config first (has correct relative prefixes).
         if self.stage_config_name is not None:
+            config_stage = self.stage_config_name.removesuffix("_config")
+            stage_owns_config = self.model_stage is None or self.model_stage == config_stage
             stage_cfg = getattr(self.hf_config, self.stage_config_name, None)
-            if stage_cfg is not None:
+            if stage_owns_config and stage_cfg is not None:
                 text_cfg = getattr(stage_cfg, "text_config", None)
                 if text_cfg is not None:
                     quant_cfg = self._normalize_quantization_config(text_cfg)
@@ -63,7 +67,7 @@ class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
                     # the suffix doesn't match, so a non-standard name
                     # would just use itself as prefix — safe but worth
                     # verifying if new stage names are introduced.
-                    hf_prefix = self.stage_config_name.removesuffix("_config") + "."
+                    hf_prefix = (self.model_stage or config_stage) + "."
                     if isinstance(block_names, str):
                         block_names = [b.strip() for b in block_names.split(",")]
                     if isinstance(block_names, list) and not any(b.startswith(hf_prefix) for b in block_names):
@@ -181,6 +185,7 @@ class OmniModelConfig(ModelConfig):
                 self.hf_config,
                 self.hf_text_config,
                 stage_config_name=self.hf_config_name,
+                model_stage=self.model_stage,
             )
             return convertor.convert()
         return super().get_model_arch_config()
